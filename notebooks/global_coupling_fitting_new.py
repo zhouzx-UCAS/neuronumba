@@ -334,11 +334,13 @@ def load_sc(fmri_path, scale):
 
 
 def simulate(exec_env, g):
-    model = ModelFactory.create_model(exec_env['model']).set_attributes(exec_env['model_attributes'])
+    # model_attributes is optional; default to empty dict
+    model = ModelFactory.create_model(exec_env['model']).set_attributes(exec_env.get('model_attributes', {}))
     weights = exec_env['weights']
-    if 'weights_sigma_factor' in exec_env:
+    sigma = exec_env.get('weights_sigma_factor', 0.0)
+    if sigma > 0.0:
         mmax = np.max(weights)
-        weights = weights + exec_env['weights_sigma_factor'] * mmax * np.random.normal(size=exec_env['weights'].shape)
+        weights = weights + sigma * mmax * np.random.normal(size=weights.shape)
         weights = np.where(weights < 0, 0, weights)
         w = mmax / np.max(weights)
         weights /= w
@@ -429,7 +431,7 @@ def eval_one_param(exec_env, g):
     for nsub in range(num_subjects):  # trials. Originally it was 20.
         print(f"   Simulating g={g} -> subject {nsub}/{num_subjects}!!!")
         _, bds = simulate_single_subject(exec_env, g)
-        while np.isnan(bds).any() or (np.abs(bds) > np.inf).any():  # This is certainly dangerous, we can have an infinite loop... let's hope not! ;-)
+        if np.isnan(bds).any() or np.isinf(bds).any():  # This is certainly dangerous, we can have an infinite loop... let's hope not! ;-)
             raise RuntimeError(f"Numeric error computing subject {nsub}/{num_subjects} for g={g}")
         simulated_bolds[nsub] = bds
         gc.collect()
@@ -933,25 +935,72 @@ def run(args):
     if args.observables is None or len(args.observables) == 0:
         raise RuntimeError("Please provide at least one observable using the --observables parameter")
 
-    # Time resolution parameter of the fMRI data (seconds). Each dataset will have its own tr value
-    # depending on the scanner setting used to capture the BOLD signal
+    # TR is expected in milliseconds in this script.
+    # For convenience: if --tr looks like seconds (e.g., 2.0), convert to milliseconds.
     if args.tr is None:
-        raise RuntimeError("Please provide the --tr parameter with the time resolution of the fMRI scanner (milliseconds)")
+        raise RuntimeError("Please provide --tr (milliseconds). If you pass seconds, values <50 will be auto-converted.")
     else:
-        tr = args.tr
+        tr = float(args.tr)
+        if tr < 50.0:
+            print(f"WARNING: --tr={tr} looks like seconds; converting to milliseconds -> {tr*1000.0}")
+            tr = tr * 1000.0
     # We will discard the first t_min seconds of the simulation
     t_min = 10.0 * tr / 1000.0
 
-    fmris = load_subjects_data(args.fmri_path)
-    n_frmis = len(fmris)
-    n_rois, t_max = fmris[next(iter(fmris))].shape
+    # ------------------------------------------------------------
+    # Input modes:
+    #   1) Timeseries mode (original): --fmri-path points to subject folders
+    #   2) Emp-mat mode (new): --emp-mat provides SC (C) and empirical FC (FC_emp)
+    # ------------------------------------------------------------
+    use_emp_mat = args.emp_mat is not None
 
-    timeseries = np.zeros((n_frmis, n_rois, t_max))
-    for i, fmri in enumerate(fmris.values()):
-        timeseries[i, :, :] = fmri
+    if use_emp_mat:
+        mat = hdf.loadmat(args.emp_mat)
+        sc_key = args.emp_sc_key
+        fc_key = args.emp_fc_key
+        if sc_key not in mat:
+            raise RuntimeError(f"--emp-sc-key '{sc_key}' not found in {args.emp_mat}. Keys: {list(mat.keys())}")
+        if fc_key not in mat:
+            raise RuntimeError(f"--emp-fc-key '{fc_key}' not found in {args.emp_mat}. Keys: {list(mat.keys())}")
+        C = np.array(mat[sc_key], dtype=np.float64)
+        FC_emp = np.array(mat[fc_key], dtype=np.float64)
+        if C.ndim != 2 or C.shape[0] != C.shape[1]:
+            raise RuntimeError(f"SC must be square (NxN). Got {C.shape}")
+        if FC_emp.shape != C.shape:
+            raise RuntimeError(f"FC_emp shape {FC_emp.shape} does not match SC shape {C.shape}")
 
-    # Compute the simulation length according to input data
-    t_max = t_max * tr / 1000.0 if args.tmax is None else args.tmax
+        # Minimal supported observable set for emp-mat mode
+        for item in args.observables:
+            obs_name = item.split(',')[0]
+            if obs_name != 'FC':
+                raise RuntimeError("In --emp-mat mode, only FC is supported (e.g., --observables FC,PS).")
+
+        # Use provided --tmax (seconds) because we do not have timeseries length here
+        if args.tmax is None:
+            raise RuntimeError("In --emp-mat mode you must provide --tmax (seconds).")
+        t_max = float(args.tmax)
+
+        # Normalize SC the same way as load_sc(): scale * C / max(C)
+        sc_norm = args.sc_scaling * C / np.max(C)
+
+        # Provide empirical measures directly
+        processed = {'FC': FC_emp}
+        n_frmis = 1
+        n_rois = C.shape[0]
+
+    else:
+        if args.fmri_path is None:
+            raise RuntimeError("Please provide --fmri-path (timeseries mode) or --emp-mat (SC+FC_emp mode).")
+        fmris = load_subjects_data(args.fmri_path)
+        n_frmis = len(fmris)
+        n_rois, t_max = fmris[next(iter(fmris))].shape
+
+        timeseries = np.zeros((n_frmis, n_rois, t_max))
+        for i, fmri in enumerate(fmris.values()):
+            timeseries[i, :, :] = fmri
+
+        # Compute the simulation length according to input data
+        t_max = t_max * tr / 1000.0 if args.tmax is None else args.tmax
     # Compute simulation time in milliseconds
     t_max_neuronal = (t_max + t_min - 1) * 1000.0
     t_warmup = t_min * 1000.0
@@ -962,10 +1011,10 @@ def run(args):
     # Sampling period from the raw signal data (ms)
     sampling_period = 1.0
 
-    # Load structural connectivity matrix. In our case, we average all the SC matrices of all subjects
-    sc_norm = load_sc(args.fmri_path, args.sc_scaling)
-    if args.sc_sigma > 0.0:
-        sc_norm = lambda : sc_norm + np.random.normal(loc=0.0, scale=args.sc_sigma*np.max(sc_norm), size=sc_norm.shape)
+    # Load SC in timeseries mode. In emp-mat mode, sc_norm was already set above.
+    if not use_emp_mat:
+        sc_norm = load_sc(args.fmri_path, args.sc_scaling)
+    # Do NOT wrap sc_norm into a lambda. We apply SC noise inside simulate() using weights_sigma_factor.
 
     bold = True
     if args.model not in ModelFactory.list_available_models():
@@ -977,16 +1026,19 @@ def run(args):
     
     bpf = BandPassFilter(tr=tr, k=args.bpf[0], flp=args.bpf[1], fhi=args.bpf[2]) if args.bpf is not None else None
 
-    all_fMRI = {s: d for s, d in enumerate(timeseries)}
-
     # Process (or load) empirical data
     emp_filename = os.path.join(out_file_path, 'fNeuro_emp.mat')
-    observables = create_observables_dict(args.observables, bpf)
-    if not os.path.exists(emp_filename):
-        processed = process_empirical_subjects(all_fMRI, observables)
+    if use_emp_mat:
+        # Save a copy for bookkeeping (no filtering applied clarifies we use the provided FC_emp)
         hdf.savemat(emp_filename, processed)
     else:
-        processed = {observable_name: load_2d_matrix(emp_filename, index=observable_name) for observable_name in observables.keys()}
+        all_fMRI = {s: d for s, d in enumerate(timeseries)}
+        observables = create_observables_dict(args.observables, bpf)
+        if not os.path.exists(emp_filename):
+            processed = process_empirical_subjects(all_fMRI, observables)
+            hdf.savemat(emp_filename, processed)
+        else:
+            processed = {observable_name: load_2d_matrix(emp_filename, index=observable_name) for observable_name in observables.keys()}
 
     out_file_name_pattern = os.path.join(out_file_path, 'fitting_g_{}.mat')
 
@@ -999,6 +1051,9 @@ def run(args):
         compute_g({
             'verbose':True,
             'model': args.model,
+            'model_attributes': {},
+            'weights_sigma_factor': args.sc_sigma,
+            'bpf': bpf,
             'dt': dt,
             'weights': sc_norm,
             'processed': processed,
@@ -1019,6 +1074,9 @@ def run(args):
         compute_g_mp({
             'verbose': True,
             'model': args.model,
+            'model_attributes': {},
+            'weights_sigma_factor': args.sc_sigma,
+            'bpf': bpf,
             'dt': dt,
             'weights': sc_norm,
             'processed': processed,
@@ -1053,6 +1111,9 @@ def run(args):
                 exec_env = {
                     'verbose': True,
                     'model': args.model,
+                    'model_attributes': {},
+                    'weights_sigma_factor': args.sc_sigma,
+                    'bpf': bpf,
                     'dt': dt,
                     'weights': sc_norm,
                     'processed': processed,
@@ -1095,6 +1156,9 @@ def run(args):
         base_exec_env = {
             'verbose': True,
             'model': args.model,
+            'model_attributes': {},
+            'weights_sigma_factor': args.sc_sigma,
+            'bpf': bpf,
             'dt': dt,
             'weights': sc_norm,
             'processed': processed,
@@ -1304,12 +1368,16 @@ def gen_arg_parser():
     parser.add_argument("--observables", nargs='+', type=str, help="Pairs (comma separated) of observables,distance to use (FC, phFCD, swFCD),(PS, KS)")
     parser.add_argument("--bold-model", type=str, default='Stephan2007', help="BOLD Model to use (Stephan2008, Stephan2007, Stephan2007Alt)")
     parser.add_argument("--out-path", type=str, required=True, help="Path to folder for output results")
-    parser.add_argument("--tr", type=float, help="Time resolution of fMRI scanner (seconds)")
+    parser.add_argument("--tr", type=float, help="Time resolution of fMRI scanner (milliseconds; if <50, treated as seconds and converted)")
     parser.add_argument("--sc-scaling", type=float, default=0.2, help="Scaling factor for the SC matrix")
     parser.add_argument("--sc-sigma", type=float, default=0.0, help="Sigma scale value to generate noise for the SC matrix")
     parser.add_argument("--scale-signal", type=float, default=1.0, help="Scaling signal factor for unit conversion")
     parser.add_argument("--tmax", type=float, help="Override simulation time (seconds)")
     parser.add_argument("--fmri-path", type=str, help="Path to fMRI timeseries data")
+    # Empirical MAT mode: SC + FC_emp without timeseries
+    parser.add_argument("--emp-mat", type=str, default=None, help="Path to .mat containing SC and FC_emp (no timeseries required)")
+    parser.add_argument("--emp-sc-key", type=str, default="C", help="Key name for SC inside --emp-mat (default: C)")
+    parser.add_argument("--emp-fc-key", type=str, default="FC_emp", help="Key name for empirical FC inside --emp-mat (default: FC_emp)")
     parser.add_argument("--plot-g", action='store_true', default=False, help="Plot G optimization results")
     parser.add_argument("--param", action='append', nargs="+", type=str, help="Parameter values to use in the model, e.g. --param single tau_e 10.0 --param range J_ee 5.0 15.0 1.0")
 
