@@ -7,6 +7,7 @@ import glob
 import itertools
 import os
 import secrets
+import random
 import time
 import sys
 
@@ -272,16 +273,6 @@ def load_subject_list(path):
     return subjects
 
 
-
-def load_subject_list(path):
-    subjects = []
-    with open(path, newline='') as csvfile:
-        reader = csv.reader(csvfile, delimiter=' ', quotechar='|')
-        for row in reader:
-            subjects.append(int(row[0]))
-    return subjects
-
-
 def save_selected_subjcets(path, subj):
     with open(path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile, delimiter=' ',
@@ -423,7 +414,7 @@ def eval_one_param(exec_env, g):
         else:
             J = FICDeco2014(model=exec_env['model'],
                             obs_var=exec_env['obs_var'],
-                            integrator=exec_env['integrator']).compute_J(exec_env['weights'], g)
+                            integrator=IntegratorFactory.create_integrator(exec_env['model'], exec_env['dt'])).compute_J(exec_env['weights'], g)
             hdf.savemat(J_file_name_pattern, {'J': J})
         exec_env['J'] = J
     simulated_bolds = {}
@@ -561,8 +552,10 @@ def process_empirical_subjects(bold_signals, observables: dict[str, ObservableCo
 
 def executor_simulate_single_subject(n, exec_env, g):
     try:
-        seed = secrets.randbits(32)
-        np.random.seed(seed)  # Ensure reproducibility for each subject
+        # Deterministic seed based only on (g, n)
+        seed = (int(round(float(g) * 1_000_000)) + 1_000_003 * int(n)) & 0xFFFFFFFF
+        np.random.seed(seed)
+        random.seed(seed)
         signal, bold = simulate_single_subject(exec_env, g)
         if exec_env.get('callback_simulate_single_subject', None) is not None:
             exec_env['callback_simulate_single_subject'](n, exec_env, signal, bold)
@@ -573,8 +566,10 @@ def executor_simulate_single_subject(n, exec_env, g):
 
 def executor_simulate_single_subject_raw(n, exec_env, g):
     try:
-        seed = secrets.randbits(32)
-        np.random.seed(seed)  # Ensure reproducibility for each subject
+        # Deterministic seed based only on (g, n)
+        seed = (int(round(float(g) * 1_000_000)) + 1_000_003 * int(n)) & 0xFFFFFFFF
+        np.random.seed(seed)
+        random.seed(seed)
         return n, simulate(exec_env, g)
     except Exception as e:
         raise RuntimeError(f"Error simulating subject {n}: {e}")
@@ -593,46 +588,61 @@ def execute_multiprocessing_simulation(exec_env, g, nproc, executor_func=None, r
         
     Returns:
         Tuple of (simulated_results, numerical_error)
+    
+    Note: result_key is currently unused.
     """
     if executor_func is None:
         executor_func = executor_simulate_single_subject
-        
-    out_file = exec_env['out_file']
-
-    if os.path.exists(out_file):
-        print(f"File {out_file} already exists, skipping...")
-        return {}, False
-
-    print(f'Computing executor for G={g}', flush=True)
 
     subjects = list(range(exec_env['num_subjects']))
     results = []
     print(f'Creating process pool with {nproc} workers')
+
+    max_retries = 3
+    fail_count = {n: 0 for n in subjects}
+
     pending = subjects
     while len(pending) > 0:
         print(f"EXECUTOR --- START cycle for {len(pending)} subjects")
-        pool = ProcessPoolExecutor(max_workers=nproc)
         futures = []
         future2subj = {}
-        for n in pending:
-            f = pool.submit(executor_func, n, exec_env, g)
-            future2subj[f] = n
-            futures.append(f)
 
-        print(f"EXECUTOR --- WAITING for {len(futures)} futures to finish")
+        # Use context manager so the pool is always closed
+        with ProcessPoolExecutor(max_workers=nproc) as pool:
+            for n in pending:
+                f = pool.submit(executor_func, n, exec_env, g)
+                future2subj[f] = n
+                futures.append(f)
 
-        pending = []
-        for future in as_completed(futures):
-            try:
-                n, result = future.result()
-                results.append((n, result))
-                print(f"EXECUTOR --- FINISHED subject {n}")
-            except Exception as exc:
-                print(f"EXECUTOR --- FAIL subject {n}. Cause: {exc}. Restarting pool.")
-                pool.shutdown(wait=True, cancel_futures=True)
-                finished = [n for n, _ in results]
-                pending = [n for n in subjects if n not in finished]
-                break
+            print(f"EXECUTOR --- WAITING for {len(futures)} futures to finish")
+
+            pending = []
+            for future in as_completed(futures):
+                try:
+                    n, result = future.result()
+                    results.append((n, result))
+                    print(f"EXECUTOR --- FINISHED subject {n}")
+                except Exception as exc:
+                    failed_n = future2subj.get(future, None)
+
+                    if failed_n is not None:
+                        fail_count[failed_n] += 1
+                        print(
+                            f"EXECUTOR --- FAIL subject {failed_n} "
+                            f"(attempt {fail_count[failed_n]}/{max_retries}). "
+                            f"Cause: {exc}. Restarting pool."
+                        )
+                        if fail_count[failed_n] >= max_retries:
+                            raise RuntimeError(
+                                f"Subject {failed_n} failed {fail_count[failed_n]} times "
+                                f"(max_retries={max_retries}). Aborting to avoid infinite loop."
+                            ) from exc
+                    else:
+                        print(f"EXECUTOR --- FAIL subject {failed_n}. Cause: {exc}. Restarting pool.")
+
+                    finished = [n for n, _ in results]
+                    pending = [n for n in subjects if n not in finished]
+                    break  # restart while cycle
 
     simulated_results = {}
     numerical_error = False
@@ -690,7 +700,7 @@ def compute_g_mp(exec_env, g, nproc):
     simulated_bolds, numerical_error = execute_multiprocessing_simulation_bold(exec_env, g, nproc)
 
     if numerical_error:
-        sim_measures = {"error": "Nan or Inf in bold signals"}
+        sim_measures = {"error": "Nan or Inf in bold signals", "g": g}
         print(f"EXECUTOR --- NUMERICAL ERROR for {out_file}")
         hdf.savemat(out_file, sim_measures)
     else:
@@ -944,7 +954,7 @@ def run(args):
         if tr < 50.0:
             print(f"WARNING: --tr={tr} looks like seconds; converting to milliseconds -> {tr*1000.0}")
             tr = tr * 1000.0
-    # We will discard the first t_min seconds of the simulation
+    # Discard the first 10 TRs of the simulation (in seconds)
     t_min = 10.0 * tr / 1000.0
 
     # ------------------------------------------------------------
@@ -1002,7 +1012,7 @@ def run(args):
         # Compute the simulation length according to input data
         t_max = t_max * tr / 1000.0 if args.tmax is None else args.tmax
     # Compute simulation time in milliseconds
-    t_max_neuronal = (t_max + t_min - 1) * 1000.0
+    t_max_neuronal = (t_max + t_min) * 1000.0
     t_warmup = t_min * 1000.0
 
     # Common integration parameters
@@ -1049,7 +1059,7 @@ def run(args):
     if args.g is not None and not args.use_mp:
         # Single point execution for debugging purposes
         compute_g({
-            'verbose':True,
+            'verbose': args.verbose,
             'model': args.model,
             'model_attributes': {},
             'weights_sigma_factor': args.sc_sigma,
@@ -1072,7 +1082,7 @@ def run(args):
 
     elif args.g is not None and args.use_mp:
         compute_g_mp({
-            'verbose': True,
+            'verbose': args.verbose,
             'model': args.model,
             'model_attributes': {},
             'weights_sigma_factor': args.sc_sigma,
@@ -1109,7 +1119,7 @@ def run(args):
             print(f"EXECUTOR --- START cycle for {len(remaining_gs)} gs")
             for gf in remaining_gs:
                 exec_env = {
-                    'verbose': True,
+                    'verbose': args.verbose,
                     'model': args.model,
                     'model_attributes': {},
                     'weights_sigma_factor': args.sc_sigma,
@@ -1154,7 +1164,7 @@ def run(args):
         
         # Create base execution environment
         base_exec_env = {
-            'verbose': True,
+            'verbose': args.verbose,
             'model': args.model,
             'model_attributes': {},
             'weights_sigma_factor': args.sc_sigma,
@@ -1172,7 +1182,7 @@ def run(args):
             't_warmup': t_warmup,
             'sampling_period': sampling_period,
             'force_recomputations': False,
-            "scale_signal": args.scale_signal
+            'scale_signal': args.scale_signal
         }
         
         # Run parameter exploration
