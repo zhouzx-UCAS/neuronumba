@@ -132,7 +132,7 @@ def create_observable_config(observable_name, distance_measures, band_pass_filte
 def create_observables_dict(observables, bpf):
     obs_dict = {}
     for item in observables:
-        l = item.split(",")
+        l = item.split(',')
         obs_name = l[0]
         if obs_name in obs_dict:
             raise ValueError(f"Duplicate observable name: {obs_name}")
@@ -253,7 +253,7 @@ class IntegratorFactory:
         if model_name == 'Hopf':
             return np.r_[1e-2, 1e-2]
         elif model_name == 'Deco2014':
-            return np.r_[1e-3, 1e-3]
+            return np.r_[2e-4, 2e-4]
         elif model_name == 'Montbrio':
             return np.r_[0.0, 0.0, 0.0, 0.0, 1e-3, 1e-3]
         elif model_name == 'Zerlaut2O':
@@ -1119,51 +1119,50 @@ def run(args):
                 raise RuntimeError(f"--g-range failed after {max_retry_cycles} retry cycles. Still failing gs: {remaining_gs}")
             # NOTE: in --g-range mode, --nproc controls the number of parallel *g jobs* (not subjects/trials)
             print(f'Creating process pool with {args.nproc} workers (parallel g)')
-            pool = ProcessPoolExecutor(max_workers=args.nproc)
-            futures = []
-            future_to_g = {}
-            
-            print(f"EXECUTOR --- START cycle for {len(remaining_gs)} gs")
-            for gf in remaining_gs:
-                exec_env = {
-                    'verbose': args.verbose,
-                    'model': args.model,
-                    'model_attributes': {},
-                    'weights_sigma_factor': args.sc_sigma,
-                    'bpf': bpf,
-                    'dt': dt,
-                    'weights': sc_norm,
-                    'processed': processed,
-                    'tr': tr,
-                    'observables': args.observables,
-                    'obs_var': args.obs_var,
-                    'bold': bold,
-                    'bold_model': bold_model,
-                    'out_file': out_file_name_pattern.format(np.round(gf, decimals=3)),
-                    'num_subjects': n_subj,
-                    't_max_neuronal': t_max_neuronal,
-                    't_warmup': t_warmup,
-                    'sampling_period': sampling_period
-                }
-                future = pool.submit(compute_g, exec_env, gf)
-                future_to_g[future] = gf
-                futures.append(future)
+            failed_gs = []
+            with ProcessPoolExecutor(max_workers=args.nproc) as pool:
+                futures = []
+                future_to_g = {}
+                
+                print(f"EXECUTOR --- START cycle for {len(remaining_gs)} gs")
+                for gf in remaining_gs:
+                    exec_env = {
+                        'verbose': args.verbose,
+                        'model': args.model,
+                        'model_attributes': {},
+                        'weights_sigma_factor': args.sc_sigma,
+                        'bpf': bpf,
+                        'dt': dt,
+                        'weights': sc_norm,
+                        'processed': processed,
+                        'tr': tr,
+                        'observables': args.observables,
+                        'obs_var': args.obs_var,
+                        'bold': bold,
+                        'bold_model': bold_model,
+                        'out_file': out_file_name_pattern.format(np.round(gf, decimals=3)),
+                        'num_subjects': n_subj,
+                        't_max_neuronal': t_max_neuronal,
+                        't_warmup': t_warmup,
+                        'sampling_period': sampling_period
+                    }
+                    future = pool.submit(compute_g, exec_env, gf)
+                    future_to_g[future] = gf
+                    futures.append(future)
+                print(f"EXECUTOR --- WAITING for {len(futures)} futures to finish")
+                
+                for future in as_completed(futures):
+                    gf = future_to_g[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                        finished_gs.append(gf)
+                        print(f"EXECUTOR --- FINISHED process for g={gf}")
+                    except Exception as exc:
+                        print(f"EXECUTOR --- FAIL computation for g={gf}. Error: {exc}")
+                        failed_gs.append(gf)
 
-            print(f"EXECUTOR --- WAITING for {len(futures)} futures to finish")
-            
-            remaining_gs = []
-            for future in as_completed(futures):
-                gf = future_to_g[future]
-                try:
-                    result = future.result()
-                    results.append(result)
-                    finished_gs.append(gf)
-                    print(f"EXECUTOR --- FINISHED process for g={gf}")
-                except Exception as exc:
-                    print(f"EXECUTOR --- FAIL computation for g={gf}. Error: {exc}")
-                    remaining_gs = [g for g in gs if g not in finished_gs]
-
-            pool.shutdown(wait=True, cancel_futures=True)
+            remaining_gs = failed_gs
 
     elif args.param is not None:
         # Parameter exploration
