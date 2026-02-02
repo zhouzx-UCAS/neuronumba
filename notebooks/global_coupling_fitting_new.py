@@ -6,14 +6,12 @@ import gc
 import glob
 import itertools
 import os
-import secrets
 import random
 import time
 import sys
 
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from numpy.ma.core import repeat
 
 # import numba
 # Disable JIT compilation for debugging purposes
@@ -333,8 +331,10 @@ def simulate(exec_env, g):
         mmax = np.max(weights)
         weights = weights + sigma * mmax * np.random.normal(size=weights.shape)
         weights = np.where(weights < 0, 0, weights)
-        w = mmax / np.max(weights)
-        weights /= w
+        # Rescale back to original max (mmax) after adding noise
+        newmax = np.max(weights)
+        if newmax > 0:
+            weights *= (mmax / newmax)
     obs_var = exec_env['obs_var']
     t_max_neuronal = exec_env['t_max_neuronal']
     t_warmup = exec_env['t_warmup']
@@ -422,7 +422,7 @@ def eval_one_param(exec_env, g):
     for nsub in range(num_subjects):  # trials. Originally it was 20.
         print(f"   Simulating g={g} -> subject {nsub}/{num_subjects}!!!")
         _, bds = simulate_single_subject(exec_env, g)
-        if np.isnan(bds).any() or np.isinf(bds).any():  # This is certainly dangerous, we can have an infinite loop... let's hope not! ;-)
+        if np.isnan(bds).any() or np.isinf(bds).any():
             raise RuntimeError(f"Numeric error computing subject {nsub}/{num_subjects} for g={g}")
         simulated_bolds[nsub] = bds
         gc.collect()
@@ -1109,9 +1109,16 @@ def run(args):
         results = []
         remaining_gs = list(gs)
         finished_gs = []
+        # Safety: avoid infinite retry loops if some g values always fail
+        max_retry_cycles = 5
+        retry_cycle = 0
           
         while len(remaining_gs) > 0:
-            print(f'Creating process pool with {args.nproc} workers')
+            retry_cycle += 1
+            if retry_cycle > max_retry_cycles:
+                raise RuntimeError(f"--g-range failed after {max_retry_cycles} retry cycles. Still failing gs: {remaining_gs}")
+            # NOTE: in --g-range mode, --nproc controls the number of parallel *g jobs* (not subjects/trials)
+            print(f'Creating process pool with {args.nproc} workers (parallel g)')
             pool = ProcessPoolExecutor(max_workers=args.nproc)
             futures = []
             future_to_g = {}
@@ -1156,7 +1163,7 @@ def run(args):
                     print(f"EXECUTOR --- FAIL computation for g={gf}. Error: {exc}")
                     remaining_gs = [g for g in gs if g not in finished_gs]
 
-            pool.shutdown(wait=False, cancel_futures=True)
+            pool.shutdown(wait=True, cancel_futures=True)
 
     elif args.param is not None:
         # Parameter exploration
@@ -1189,7 +1196,7 @@ def run(args):
         run_parameter_exploration(param_explore, base_exec_env, out_file_path, args.nproc)
 
     else:
-        RuntimeError("Neither --g, --g-range, nor --param has been defined")
+        raise RuntimeError("Neither --g, --g-range, nor --param has been defined")
 
 
 def parse_parameter_definitions(param_args):
@@ -1383,9 +1390,9 @@ def gen_arg_parser():
     parser.add_argument("--sc-sigma", type=float, default=0.0, help="Sigma scale value to generate noise for the SC matrix")
     parser.add_argument("--scale-signal", type=float, default=1.0, help="Scaling signal factor for unit conversion")
     parser.add_argument("--tmax", type=float, help="Override simulation time (seconds)")
-    parser.add_argument("--fmri-path", type=str, help="Path to fMRI timeseries data")
+    parser.add_argument("--fmri-path", type=str, help="Path to fMRI timeseries data. Expected layout: <fmri-path>/<subject>/rfMRI_REST1_LR_BOLD.csv and <fmri-path>/<subject>/Counts.csv (subject folders typically like 000, 001, ...).")
     # Empirical MAT mode: SC + FC_emp without timeseries
-    parser.add_argument("--emp-mat", type=str, default=None, help="Path to .mat containing SC and FC_emp (no timeseries required)")
+    parser.add_argument("--emp-mat", type=str, default=None, help="Path to .mat containing SC and FC_emp (no timeseries required). Assumption: FC_emp is already computed from band-pass filtered BOLD consistent with --bpf.")
     parser.add_argument("--emp-sc-key", type=str, default="C", help="Key name for SC inside --emp-mat (default: C)")
     parser.add_argument("--emp-fc-key", type=str, default="FC_emp", help="Key name for empirical FC inside --emp-mat (default: FC_emp)")
     parser.add_argument("--plot-g", action='store_true', default=False, help="Plot G optimization results")
