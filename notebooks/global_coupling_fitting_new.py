@@ -1112,7 +1112,7 @@ def run(args):
         # Safety: avoid infinite retry loops if some g values always fail
         max_retry_cycles = 5
         retry_cycle = 0
-          
+        
         while len(remaining_gs) > 0:
             retry_cycle += 1
             if retry_cycle > max_retry_cycles:
