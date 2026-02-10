@@ -11,6 +11,10 @@ from neuronumba.simulator.integrators import EulerStochastic
 from neuronumba.simulator.monitors import TemporalAverage
 from neuronumba.numba_tools.config import NUMBA_CACHE, NUMBA_FASTMATH, NUMBA_NOGIL
 
+@nb.njit(cache=False)
+def _numba_seed(seed: int):
+    # Seed Numba's RNG used by np.random.* inside njit kernels
+    np.random.seed(seed)
 
 class Simulator(HasAttr):
     """
@@ -75,9 +79,12 @@ class Simulator(HasAttr):
 # =====================================================================================
 # Convenience method to put all components together
 # =====================================================================================
-def simulate_nodelay(model, integrator, weights, obs_var, sampling_period, t_max_neuronal, t_warmup):
+def simulate_nodelay(model, integrator, weights, obs_var, sampling_period, t_max_neuronal, t_warmup, seed=None):
     n_rois = weights.shape[0]
-    lengths = np.random.rand(n_rois, n_rois)*10.0 + 1.0
+    if seed is not None:
+        _numba_seed(int(seed) & 0xFFFFFFFF)
+    # Use deterministic lengths to avoid extra randomness in the simulation setup
+    lengths = np.ones((n_rois, n_rois), dtype=np.float64)
     speed = 1.0
     con = Connectivity(weights=weights, lengths=lengths, speed=speed)
     history = HistoryNoDelays()

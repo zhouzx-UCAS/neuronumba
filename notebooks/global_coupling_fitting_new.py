@@ -322,7 +322,7 @@ def load_sc(fmri_path, scale):
     return scale * sc / sc.max()
 
 
-def simulate(exec_env, g):
+def simulate(exec_env, g, seed=None):
     # model_attributes is optional; default to empty dict
     model = ModelFactory.create_model(exec_env['model']).set_attributes(exec_env.get('model_attributes', {}))
     weights = exec_env['weights']
@@ -345,15 +345,15 @@ def simulate(exec_env, g):
         model.configure(J=exec_env['J'])
 
     start_t = time.time()
-    signal = simulate_nodelay(model, integrator, weights, obs_var, sampling_period, t_max_neuronal, t_warmup)
+    signal = simulate_nodelay(model, integrator, weights, obs_var, sampling_period, t_max_neuronal, t_warmup, seed)
     diff_t = time.time() - start_t
     if exec_env['verbose']:
         print(f"Execution time: {diff_t}")
     return signal
 
 
-def simulate_single_subject(exec_env, g):
-    signal = simulate(exec_env, g) * exec_env.get('scale_signal', 1.0)
+def simulate_single_subject(exec_env, g, seed=None):
+    signal = simulate(exec_env, g, seed) * exec_env.get('scale_signal', 1.0)
     sampling_period = exec_env['sampling_period']
     if exec_env['bold']:
         b = exec_env['bold_model']
@@ -386,7 +386,7 @@ def process_bold_signals(bold_signals, observables_list, band_pass_filter=None, 
         measureValues[ds] = observables[ds].init_accumulator(num_subjects, N)
 
     # Loop over subjects
-    for pos, s in enumerate(bold_signals):
+    for pos, s in enumerate(sorted(bold_signals.keys())):
         if verbose:
             print('   Processing signal {}/{} Subject: {} ({}x{})'.format(pos + 1, num_subjects, s, bold_signals[s].shape[0], bold_signals[s].shape[1]), end='', flush=True)
         signal = bold_signals[s]  # LR_version_symm(tc[s])
@@ -421,7 +421,11 @@ def eval_one_param(exec_env, g):
     num_subjects = exec_env['num_subjects']
     for nsub in range(num_subjects):  # trials. Originally it was 20.
         print(f"   Simulating g={g} -> subject {nsub}/{num_subjects}!!!")
-        _, bds = simulate_single_subject(exec_env, g)
+        # Deterministic seed based only on (g, nsub)
+        seed = (int(round(float(g) * 1_000_000)) + 1_000_003 * int(nsub)) & 0xFFFFFFFF
+        np.random.seed(seed)
+        random.seed(seed)
+        _, bds = simulate_single_subject(exec_env, g, seed)
         if np.isnan(bds).any() or np.isinf(bds).any():
             raise RuntimeError(f"Numeric error computing subject {nsub}/{num_subjects} for g={g}")
         simulated_bolds[nsub] = bds
@@ -531,7 +535,7 @@ def process_empirical_subjects(bold_signals, observables: dict[str, ObservableCo
         measureValues[ds] = observable_config.init_accumulator(num_subjects, n_rois)
 
     # Loop over subjects
-    for pos, s in enumerate(bold_signals):
+    for pos, s in enumerate(sorted(bold_signals.keys())):
         # BOLD signals from file have inverse shape
         signal = bold_signals[s].T  # need to be transposed for the rest of NeuroNumba...
 
@@ -556,7 +560,7 @@ def executor_simulate_single_subject(n, exec_env, g):
         seed = (int(round(float(g) * 1_000_000)) + 1_000_003 * int(n)) & 0xFFFFFFFF
         np.random.seed(seed)
         random.seed(seed)
-        signal, bold = simulate_single_subject(exec_env, g)
+        signal, bold = simulate_single_subject(exec_env, g, seed)
         if exec_env.get('callback_simulate_single_subject', None) is not None:
             exec_env['callback_simulate_single_subject'](n, exec_env, signal, bold)
         return n, bold
@@ -570,7 +574,7 @@ def executor_simulate_single_subject_raw(n, exec_env, g):
         seed = (int(round(float(g) * 1_000_000)) + 1_000_003 * int(n)) & 0xFFFFFFFF
         np.random.seed(seed)
         random.seed(seed)
-        return n, simulate(exec_env, g)
+        return n, simulate(exec_env, g, seed)
     except Exception as e:
         raise RuntimeError(f"Error simulating subject {n}: {e}")
         
