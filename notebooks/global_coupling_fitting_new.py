@@ -33,6 +33,7 @@ from neuronumba.simulator.integrators.euler import EulerStochastic
 from neuronumba.simulator.simulator import simulate_nodelay
 from neuronumba.tools.loader import load_2d_matrix
 
+from Deco2018.serotonin2A import Deco2018
 
 class ObservableConfig:
     """
@@ -146,6 +147,7 @@ class ModelFactory:
     _creators = {
         'Montbrio': lambda: Montbrio(),
         'Deco2014': lambda: Deco2014(),
+        'Deco2018': lambda: Deco2018(auto_fic=True),
         'Zerlaut2O': lambda: ZerlautAdaptationSecondOrder(),
         'Hopf': lambda: Hopf()
     }
@@ -212,6 +214,7 @@ class IntegratorFactory:
     _configurations = {
         'Hopf': lambda dt: EulerStochastic(dt=dt, sigmas=np.r_[1e-2, 1e-2]),
         'Deco2014': lambda dt: EulerStochastic(dt=dt, sigmas=np.r_[2e-4, 2e-4]),
+        'Deco2018': lambda dt: EulerStochastic(dt=dt, sigmas=np.r_[2e-4, 2e-4]),
         'Montbrio': lambda dt: EulerStochastic(dt=dt, sigmas=np.r_[0.0, 0.0, 0.0, 0.0, 1e-3, 1e-3]),
         'Zerlaut2O': lambda dt: EulerStochastic(dt=dt, sigmas=np.r_[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-3]),
     }
