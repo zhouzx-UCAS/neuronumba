@@ -12,6 +12,7 @@ import sys
 
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 # import numba
 # Disable JIT compilation for debugging purposes
@@ -356,7 +357,8 @@ def simulate_single_subject(exec_env, g, seed=None):
     signal = simulate(exec_env, g, seed) * exec_env.get('scale_signal', 1.0)
     sampling_period = exec_env['sampling_period']
     if exec_env['bold']:
-        b = exec_env['bold_model']
+        bname = exec_env.get('bold_model_name', 'Stephan2008')
+        b = BoldModelFactory.create_model(bname)
         bds = b.compute_bold(signal, sampling_period)
         return signal, bds
     else:
@@ -612,7 +614,8 @@ def execute_multiprocessing_simulation(exec_env, g, nproc, executor_func=None, r
         future2subj = {}
 
         # Use context manager so the pool is always closed
-        with ProcessPoolExecutor(max_workers=nproc) as pool:
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=nproc, mp_context=ctx) as pool:
             for n in pending:
                 f = pool.submit(executor_func, n, exec_env, g)
                 future2subj[f] = n
@@ -1058,8 +1061,6 @@ def run(args):
 
     n_subj = args.nsubj if args.nsubj is not None else n_frmis
 
-    bold_model = BoldModelFactory.create_model(args.bold_model)
-
     if args.g is not None and not args.use_mp:
         # Single point execution for debugging purposes
         compute_g({
@@ -1075,7 +1076,7 @@ def run(args):
             'observables': args.observables,
             'obs_var': args.obs_var,
             'bold': bold,
-            'bold_model': bold_model,
+            'bold_model_name': args.bold_model,
             'out_file': out_file_name_pattern.format(np.round(args.g, decimals=3)),
             'num_subjects': n_subj,
             't_max_neuronal': t_max_neuronal,
@@ -1098,7 +1099,7 @@ def run(args):
             'observables': args.observables,
             'obs_var': args.obs_var,
             'bold': bold,
-            'bold_model': bold_model,
+            'bold_model_name': args.bold_model,
             'out_file': out_file_name_pattern.format(np.round(args.g, decimals=3)),
             'num_subjects': n_subj,
             't_max_neuronal': t_max_neuronal,
@@ -1124,7 +1125,8 @@ def run(args):
             # NOTE: in --g-range mode, --nproc controls the number of parallel *g jobs* (not subjects/trials)
             print(f'Creating process pool with {args.nproc} workers (parallel g)')
             failed_gs = []
-            with ProcessPoolExecutor(max_workers=args.nproc) as pool:
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=args.nproc, mp_context=ctx) as pool:
                 futures = []
                 future_to_g = {}
                 
@@ -1143,7 +1145,7 @@ def run(args):
                         'observables': args.observables,
                         'obs_var': args.obs_var,
                         'bold': bold,
-                        'bold_model': bold_model,
+                        'bold_model_name': args.bold_model,
                         'out_file': out_file_name_pattern.format(np.round(gf, decimals=3)),
                         'num_subjects': n_subj,
                         't_max_neuronal': t_max_neuronal,
@@ -1186,7 +1188,7 @@ def run(args):
             'observables': args.observables,
             'obs_var': args.obs_var,
             'bold': bold,
-            'bold_model': bold_model,
+            'bold_model_name': args.bold_model,
             'num_subjects': n_subj,
             't_max_neuronal': t_max_neuronal,
             't_warmup': t_warmup,
