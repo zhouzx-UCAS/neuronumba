@@ -49,14 +49,28 @@ class Deco2018(LinearCouplingModel):
     I_external = Attr(default=0.0, attributes=Model.Type.Model)
 
     receptor = Attr(default=0.0, attributes=Model.Type.Model)
-    w_gain_e = Attr(default=0.0, attributes=Model.Type.Model)
+    w_gain_e = Attr(default=1.0, attributes=Model.Type.Model)
     w_gain_i = Attr(default=0.0, attributes=Model.Type.Model)
+    receptor_map = Attr(default=None, attributes=Model.Type.Model)
 
     @overrides
     def _init_dependant(self):
         super()._init_dependant()
         if self.auto_fic and not self._attr_defined('J'):
             self.J = FICHerzog2022().compute_J(self.weights, self.g)
+        
+        # Ensure receptor_map is a 1D float64 vector aligned with ROI order.
+        # If not provided, fall back to zeros -> placebo behavior.
+        rm = getattr(self, "receptor_map", None)
+        if rm is None:
+            self.receptor_map = np.zeros(self.weights.shape[0], dtype=np.float64)
+        else:
+            rm = np.asarray(rm, dtype=np.float64).reshape(-1)
+            if rm.shape[0] != self.weights.shape[0]:
+                raise ValueError(
+                    f"receptor_map length mismatch: got {rm.shape[0]}, expected {self.weights.shape[0]}"
+                )
+            self.receptor_map = np.ascontiguousarray(rm)
 
     @property
     def get_state_vars(self):
@@ -85,6 +99,7 @@ class Deco2018(LinearCouplingModel):
     def get_numba_dfun(self):
         m = self.m.copy()
         P = self.P
+        receptor_map = self.receptor_map
 
         @nb.njit(nb.types.UniTuple(nb.f8[:, :], 2)(nb.f8[:, :], nb.f8[:, :]))
         def Deco2018_dfun(state: NDA_f8_2d, coupling: NDA_f8_2d):
@@ -96,11 +111,15 @@ class Deco2018(LinearCouplingModel):
             Ie = m[np.intp(P.Jext_e)] * m[np.intp(P.I0)] + m[np.intp(P.w)] * m[np.intp(P.J_NMDA)] * Se + m[np.intp(P.J_NMDA)] * coupling[0, :] - m[np.intp(P.J)] * Si + m[np.intp(P.I_external)]
             # Eq for I^I (6). \lambda = 0 => no long-range feedforward inhibition (FFI)
             Ii = m[np.intp(P.Jext_i)] * m[np.intp(P.I0)] + m[np.intp(P.J_NMDA)] * Se - Si
-            y = (m[np.intp(P.ae)] * Ie - m[np.intp(P.be)]) * (1.0 + m[np.intp(P.receptor)]*m[np.intp(P.w_gain_e)])
+            # y = (m[np.intp(P.ae)] * Ie - m[np.intp(P.be)]) * (1.0 + m[np.intp(P.receptor)]*m[np.intp(P.w_gain_e)])
+            gain_e = 1.0 + (m[np.intp(P.receptor)] * m[np.intp(P.w_gain_e)]) * receptor_map
+            y = (m[np.intp(P.ae)] * Ie - m[np.intp(P.be)]) * gain_e
             # In the paper re was g_E * (I^{(E)_n} - I^{(E)_{thr}}). In the paper (7)
             # Here, we distribute as g_E * I^{(E)_n} - g_E * I^{(E)_{thr}}, thus...
             re = y / (1.0 - np.exp(-m[np.intp(P.de)] * y))
-            y = (m[np.intp(P.ai)] * Ii - m[np.intp(P.bi)]) * (1.0 + m[np.intp(P.receptor)]*m[np.intp(P.w_gain_i)])
+            # y = (m[np.intp(P.ai)] * Ii - m[np.intp(P.bi)]) * (1.0 + m[np.intp(P.receptor)]*m[np.intp(P.w_gain_i)])
+            gain_i = 1.0 + (m[np.intp(P.receptor)] * m[np.intp(P.w_gain_i)]) * receptor_map
+            y = (m[np.intp(P.ai)] * Ii - m[np.intp(P.bi)]) * gain_i
             # In the paper ri was g_I * (I^{(I)_n} - I^{(I)_{thr}}). In the paper (8)
             # Apply same distributing as above...
             ri = y / (1.0 - np.exp(-m[np.intp(P.di)] * y))
