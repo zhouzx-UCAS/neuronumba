@@ -33,6 +33,35 @@ from neuronumba.simulator.integrators.euler import EulerStochastic
 from neuronumba.simulator.simulator import simulate_nodelay
 from neuronumba.tools.loader import load_2d_matrix
 
+def load_receptor_map_from_csv(csv_path: str, map_name: str) -> np.ndarray:
+    """Load one receptor map from a CSV and apply default normalization.
+
+    Expected CSV format:
+      - one ROW per map
+      - first column named 'map'
+      - remaining columns are ROI values (float), already aligned to the model ROI order
+
+    Normalization (default): max-normalize so that max(map)=1 (if max>0).
+    """
+    if csv_path is None:
+        raise RuntimeError("--receptor-csv is None")
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Receptor CSV not found: {csv_path}")
+
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None or 'map' not in reader.fieldnames:
+            raise RuntimeError(f"Receptor CSV must have a 'map' column. Header: {reader.fieldnames}")
+        roi_cols = [c for c in reader.fieldnames if c != 'map']
+        for row in reader:
+            if row.get('map', None) == map_name:
+                vals = np.asarray([float(row[c]) for c in roi_cols], dtype=np.float64)
+                vmax = float(np.max(vals))
+                if vmax > 0.0:
+                    vals = vals / vmax
+                return vals
+    raise RuntimeError(f"Map '{map_name}' not found in receptor CSV: {csv_path}")
+
 from Deco2018.serotonin2A import Deco2018
 
 class ObservableConfig:
@@ -1046,6 +1075,17 @@ def run(args):
     
     bpf = BandPassFilter(tr=tr, k=args.bpf[0], flp=args.bpf[1], fhi=args.bpf[2]) if args.bpf is not None else None
 
+    # ------------------------------------------------------------
+    # Fixed model attributes (always passed into model_attributes)
+    # - Deco2018: receptor_map loaded from CSV (row selected by --receptor-map)
+    #   Note: receptor_map is max-normalized inside load_receptor_map_from_csv().
+    # ------------------------------------------------------------
+    fixed_model_attributes = {}
+    if args.model == 'Deco2018' and args.receptor_csv is not None:
+        rm = load_receptor_map_from_csv(args.receptor_csv, args.receptor_map)
+        fixed_model_attributes['receptor_map'] = rm
+        print(f"[INFO] Using receptor_map='{args.receptor_map}' from {args.receptor_csv} (len={rm.size}, max={np.max(rm):.6g})")
+
     # Process (or load) empirical data
     emp_filename = os.path.join(out_file_path, 'fNeuro_emp.mat')
     if use_emp_mat:
@@ -1069,7 +1109,7 @@ def run(args):
         compute_g({
             'verbose': args.verbose,
             'model': args.model,
-            'model_attributes': {},
+            'model_attributes': dict(fixed_model_attributes),
             'weights_sigma_factor': args.sc_sigma,
             'bpf': bpf,
             'dt': dt,
@@ -1092,7 +1132,7 @@ def run(args):
         compute_g_mp({
             'verbose': args.verbose,
             'model': args.model,
-            'model_attributes': {},
+            'model_attributes': dict(fixed_model_attributes),
             'weights_sigma_factor': args.sc_sigma,
             'bpf': bpf,
             'dt': dt,
@@ -1138,7 +1178,7 @@ def run(args):
                     exec_env = {
                         'verbose': args.verbose,
                         'model': args.model,
-                        'model_attributes': {},
+                        'model_attributes': dict(fixed_model_attributes),
                         'weights_sigma_factor': args.sc_sigma,
                         'bpf': bpf,
                         'dt': dt,
@@ -1181,7 +1221,7 @@ def run(args):
         base_exec_env = {
             'verbose': args.verbose,
             'model': args.model,
-            'model_attributes': {},
+            'model_attributes': dict(fixed_model_attributes),
             'weights_sigma_factor': args.sc_sigma,
             'bpf': bpf,
             'dt': dt,
@@ -1369,7 +1409,10 @@ def run_parameter_exploration(param_explore, base_exec_env, out_file_path, nproc
 
         # Create execution environment with model parameters
         exec_env = copy.deepcopy(base_exec_env)
-        exec_env['model_attributes'] = model_params
+        # Merge fixed model attributes (e.g., receptor_map) with scanned parameters
+        merged = dict(exec_env.get('model_attributes', {}))
+        merged.update(model_params)
+        exec_env['model_attributes'] = merged
         exec_env['out_file'] = out_file
         
         # Run the computation
@@ -1403,6 +1446,12 @@ def gen_arg_parser():
     parser.add_argument("--emp-mat", type=str, default=None, help="Path to .mat containing SC and FC_emp (no timeseries required). Assumption: FC_emp is already computed from band-pass filtered BOLD consistent with --bpf.")
     parser.add_argument("--emp-sc-key", type=str, default="C", help="Key name for SC inside --emp-mat (default: C)")
     parser.add_argument("--emp-fc-key", type=str, default="FC_emp", help="Key name for empirical FC inside --emp-mat (default: FC_emp)")
+    # Deco2018 receptor-map input (CSV): one row per map; first column 'map'; remaining columns are ROI values
+    parser.add_argument("--receptor-csv", type=str, default=None,
+                        help="Path to receptor map CSV (rows=maps; col0=map name; remaining columns=ROIs).")
+    parser.add_argument("--receptor-map", type=str, default="5HT2A",
+                        help="Row name in --receptor-csv to use (default: 5HT2A).")
+
     parser.add_argument("--plot-g", action='store_true', default=False, help="Plot G optimization results")
     parser.add_argument("--param", action='append', nargs="+", type=str, help="Parameter values to use in the model, e.g. --param single tau_e 10.0 --param range J_ee 5.0 15.0 1.0")
 
